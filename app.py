@@ -67,8 +67,11 @@ def writeConfig():
         "PROXY_PORT": PROXY_PORT
     }
     
-    with open('config.json', 'w') as f:
-        json.dump([config_data], f, indent=2)
+    try:
+        with open('config.json', 'w') as f:
+            json.dump([config_data], f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not write config file: {e}")
 
 try:
     with open('config.json', 'r') as config_file:
@@ -76,10 +79,16 @@ try:
 except FileNotFoundError:
     writeConfig()
     print("Config file created.\n----------------------------")
+except Exception as e:
+    print(f"Warning: Could not read config file: {e}")
+    writeConfig()
 else:
     # Parse config
-    globals().update({k: v for k, v in config.items() if k in globals()})
-    writeConfig()
+    try:
+        globals().update({k: v for k, v in config.items() if k in globals()})
+        writeConfig()
+    except Exception as e:
+        print(f"Warning: Could not update config: {e}")
 
 
 ##### Utils #####
@@ -117,40 +126,60 @@ class account_c:
         self.positionslist = []
         self.MARGIN_MODE = 'cross' if (marginMode != None and marginMode.lower() == 'cross') else 'isolated'
         self.SETTLE_COIN = 'USDT' if(settleCoin == None) else settleCoin
+        self.markets = {}
+        self.exchange = None
 
         if(exchange == None):
-            raise ValueError('Exchange not defined')
+            print(f"Error: Exchange not defined for account {name}")
+            return
         
-        if(exchange.lower() == 'bitget'):
-            self.exchange = ccxt.bitget({
-                "apiKey": apiKey,
-                "secret": secret,
-                'password': password,
-                "options": {'defaultType': 'swap', 'defaultMarginMode': self.MARGIN_MODE, 'adjustForTimeDifference': True},
-                "enableRateLimit": False
-            })
-        else:
-            raise ValueError('Unsupported exchange')
+        try:
+            if(exchange.lower() == 'bitget'):
+                self.exchange = ccxt.bitget({
+                    "apiKey": apiKey,
+                    "secret": secret,
+                    'password': password,
+                    "options": {'defaultType': 'swap', 'defaultMarginMode': self.MARGIN_MODE, 'adjustForTimeDifference': True},
+                    "enableRateLimit": True,  # Enabled rate limiting for stability
+                    "timeout": 30000,  # 30 second timeout
+                })
+            else:
+                print(f"Error: Unsupported exchange {exchange} for account {name}")
+                return
+        except Exception as e:
+            print(f"Error creating exchange for account {name}: {e}")
+            return
 
         if(self.exchange == None):
-            raise ValueError('Exchange creation failed')
+            print(f"Error: Exchange creation failed for account {name}")
+            return
         
-        # Load basic markets info
-        self.markets = {}
+        # Load basic markets info with error handling
         try:
+            print(f"Loading markets for account {name}...")
             markets = self.exchange.load_markets()
             for key, market in markets.items():
                 if market.get('settle') == self.SETTLE_COIN:
                     self.markets[key] = market
+            print(f"Loaded {len(self.markets)} markets for account {name}")
         except Exception as e:
-            print(f"Error loading markets: {e}")
+            print(f"Warning: Error loading markets for account {name}: {e}")
+            print(f"Account {name} will continue with limited functionality")
             
-        self.refreshPositions(True)
+        # Initial position refresh with error handling
+        try:
+            self.refreshPositions(True)
+        except Exception as e:
+            print(f"Warning: Initial position refresh failed for account {name}: {e}")
 
     def print(self, *args, sep=" ", **kwargs):
-        print(timeNow(), '['+ self.accountName +'/'+ self.exchange.id +']', *args, sep=sep, **kwargs)
+        exchange_id = self.exchange.id if self.exchange else 'unknown'
+        print(timeNow(), '['+ self.accountName +'/'+ exchange_id +']', *args, sep=sep, **kwargs)
 
     def fetchBalance(self):
+        if not self.exchange:
+            return {'free': 0.0, 'used': 0.0, 'total': 0.0}
+            
         try:
             params = {"settle": self.SETTLE_COIN}
             response = self.exchange.fetch_balance(params)
@@ -158,13 +187,16 @@ class account_c:
                 return {'free': 0.0, 'used': 0.0, 'total': 0.0}
             return response.get(self.SETTLE_COIN)
         except Exception as e:
-            print(f"Error fetching balance: {e}")
+            print(f"Error fetching balance for {self.accountName}: {e}")
             return {'free': 0.0, 'used': 0.0, 'total': 0.0}
 
     def fetchAvailableBalance(self)->float:
         return float(self.fetchBalance().get('free'))
 
     def fetchAveragePrice(self, symbol)->float:
+        if not self.exchange:
+            return 0.0
+            
         try:
             orderbook = self.exchange.fetch_order_book(symbol)
             bid = orderbook['bids'][0][0] if len(orderbook['bids']) > 0 else None
@@ -175,7 +207,7 @@ class account_c:
             if(ask == None): ask = bid
             return (bid + ask) * 0.5
         except Exception as e:
-            print(f"Error fetching price: {e}")
+            print(f"Error fetching price for {symbol}: {e}")
             return 0.0
 
     def findSymbolFromPairName(self, pairString):
@@ -211,6 +243,10 @@ class account_c:
             return 0.0
 
     def refreshPositions(self, v=verbose):
+        if not self.exchange:
+            self.positionslist = []
+            return
+            
         try:
             symbols = list(self.markets.keys()) if self.markets else None
             positions = self.exchange.fetch_positions(symbols, params={'settle': self.SETTLE_COIN})
@@ -241,10 +277,14 @@ class account_c:
                 print('------------------------------')
                 
         except Exception as e:
-            print(f"Error refreshing positions: {e}")
+            print(f"Error refreshing positions for {self.accountName}: {e}")
             self.positionslist = []
 
     def proccessAlert(self, alert: dict):
+        if not self.exchange:
+            self.print(" * E: Exchange not available")
+            return
+            
         self.print(' ')
         self.print(" ALERT:", alert['alert'])
         self.print('----------------------------')
@@ -346,6 +386,10 @@ class account_c:
 accounts = []
 
 def Alert(data):
+    if not accounts:
+        print(timeNow(), ' * E: No accounts available')
+        return
+        
     account = None
     lines = data.split("\n")
     for line in lines:
@@ -375,31 +419,39 @@ def Alert(data):
 
 def refreshPositions():
     for account in accounts:
-        account.refreshPositions()
+        if account.exchange:
+            account.refreshPositions()
 
 def generatePositionsString()->str:
     msg = ''
     for account in accounts:
-        account.refreshPositions()
-        numPositions = len(account.positionslist)
-        balanceString = ''
-        if SHOW_BALANCE:
-            try:
-                balance = account.fetchBalance()
-                balanceString = f" * Balance: {balance['total']:.2f}$ - Available {balance['free']:.2f}$"
-            except:
-                balanceString = ''
+        if not account.exchange:
+            msg += f'---------------------\nAccount {account.accountName}: Exchange not available\n'
+            continue
+            
+        try:
+            account.refreshPositions()
+            numPositions = len(account.positionslist)
+            balanceString = ''
+            if SHOW_BALANCE:
+                try:
+                    balance = account.fetchBalance()
+                    balanceString = f" * Balance: {balance['total']:.2f}$ - Available {balance['free']:.2f}$"
+                except:
+                    balanceString = ' * Balance: Unable to fetch'
 
-        msg += '---------------------\n'
-        msg += f'Refreshing positions {account.accountName}: {numPositions} positions found{balanceString}\n'
-        
-        if numPositions > 0:
-            for position in account.positionslist:
-                symbol = position.get('symbol', 'Unknown')
-                side = position.get('side', 'Unknown')
-                contracts = position.get('contracts', 0.0)
-                unrealizedPnl = position.get('unrealizedPnl', 0.0)
-                msg += f"{symbol} * {side} * {contracts} * {unrealizedPnl:.2f}$\n"
+            msg += '---------------------\n'
+            msg += f'Refreshing positions {account.accountName}: {numPositions} positions found{balanceString}\n'
+            
+            if numPositions > 0:
+                for position in account.positionslist:
+                    symbol = position.get('symbol', 'Unknown')
+                    side = position.get('side', 'Unknown')
+                    contracts = position.get('contracts', 0.0)
+                    unrealizedPnl = position.get('unrealizedPnl', 0.0)
+                    msg += f"{symbol} * {side} * {contracts} * {unrealizedPnl:.2f}$\n"
+        except Exception as e:
+            msg += f'Error refreshing positions for {account.accountName}: {e}\n'
 
     return msg
 
@@ -408,13 +460,27 @@ def generatePositionsString()->str:
 ###################
 
 print('----------------------------')
+print('Starting WHOOK Bot for Koyeb...')
 
-#### Open accounts file ###
+# Initialize Flask app first
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
+# Silence Flask logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+log.disabled = True
+
+#### Load accounts file with better error handling ###
+
+accounts_data = []
 try:
     with open('accounts.json', 'r') as accounts_file:
         accounts_data = json.load(accounts_file)
+        print(f"Loaded {len(accounts_data)} account configurations")
 except FileNotFoundError:
+    print("Warning: File 'accounts.json' not found.")
+    # Create a default template but don't exit
     accounts_template = [
         {
             "ACCOUNT_ID": "your_account_name",
@@ -425,96 +491,133 @@ except FileNotFoundError:
             "MARGIN_MODE": "isolated"
         }
     ]
-    with open('accounts.json', 'w') as f:
-        json.dump(accounts_template, f, indent=2)
-    print("File 'accounts.json' not found. Template created. Please fill your API Keys into the file and try again")
-    print("Exiting.")
-    raise SystemExit()
-
-for ac in accounts_data:
-    exchange = ac.get('EXCHANGE')
-    if(exchange == None):
-        print(" * ERROR PARSING ACCOUNT INFORMATION: EXCHANGE")
-        continue
-
-    account_id = ac.get('ACCOUNT_ID')
-    if(account_id == None):
-        print(" * ERROR PARSING ACCOUNT INFORMATION: ACCOUNT_ID")
-        continue
-
-    api_key = ac.get('API_KEY')
-    if(api_key == None):
-        print(" * ERROR PARSING ACCOUNT INFORMATION: API_KEY")
-        continue
-
-    secret_key = ac.get('SECRET_KEY')
-    if(secret_key == None):
-        print(" * ERROR PARSING ACCOUNT INFORMATION: SECRET_KEY")
-        continue
-
-    password = ac.get('PASSWORD')
-    if(password == None):
-        password = ""
-
-    marginMode = ac.get('MARGIN_MODE')
-    settleCoin = ac.get('SETTLE_COIN')
-
-    print(timeNow(), " Initializing account: [", account_id, "] in [", exchange, ']')
     try:
-        account = account_c(exchange, account_id, api_key, secret_key, password, marginMode, settleCoin)
+        with open('accounts.json', 'w') as f:
+            json.dump(accounts_template, f, indent=2)
+        print("Template 'accounts.json' created.")
     except Exception as e:
-        print('Account creation failed:', e)
-        print('------------------------------')
-    else:
-        accounts.append(account)
+        print(f"Could not create template: {e}")
+except Exception as e:
+    print(f"Error reading accounts.json: {e}")
 
-if(len(accounts) == 0):
-    print(" * FATAL ERROR: No valid accounts found. Please edit 'accounts.json' and introduce your API keys")
-    raise SystemExit()
+# Process accounts with better error handling
+successful_accounts = 0
+for ac in accounts_data:
+    try:
+        exchange = ac.get('EXCHANGE')
+        if(exchange == None):
+            print(" * ERROR PARSING ACCOUNT: Missing EXCHANGE")
+            continue
+
+        account_id = ac.get('ACCOUNT_ID')
+        if(account_id == None):
+            print(" * ERROR PARSING ACCOUNT: Missing ACCOUNT_ID")
+            continue
+
+        api_key = ac.get('API_KEY')
+        if(api_key == None or api_key == "your_api_key"):
+            print(f" * ERROR PARSING ACCOUNT {account_id}: Missing or template API_KEY")
+            continue
+
+        secret_key = ac.get('SECRET_KEY')
+        if(secret_key == None or secret_key == "your_secret_key"):
+            print(f" * ERROR PARSING ACCOUNT {account_id}: Missing or template SECRET_KEY")
+            continue
+
+        password = ac.get('PASSWORD', "")
+        if password == "your_API_password":
+            password = ""
+
+        marginMode = ac.get('MARGIN_MODE')
+        settleCoin = ac.get('SETTLE_COIN')
+
+        print(timeNow(), " Initializing account: [", account_id, "] in [", exchange, ']')
+        account = account_c(exchange, account_id, api_key, secret_key, password, marginMode, settleCoin)
+        
+        # Only add account if exchange was successfully created
+        if account.exchange is not None:
+            accounts.append(account)
+            successful_accounts += 1
+            print(f" * Account {account_id} initialized successfully")
+        else:
+            print(f" * Account {account_id} failed to initialize")
+            
+    except Exception as e:
+        print(f'Account creation failed for {account_id if "account_id" in locals() else "unknown"}: {e}')
+
+print(f"Successfully initialized {successful_accounts} out of {len(accounts_data)} accounts")
 
 ############################################
 
-# define the webhook server
-app = Flask(__name__)
-# silencing flask useless spam
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-log.disabled = True
+@app.route('/', methods=['GET'])
+def home():
+    """Health check endpoint"""
+    return f'WHOOK Bot is running! {successful_accounts} accounts active.', 200
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint for Koyeb"""
+    return 'OK', 200
 
 @app.route('/whook', methods=['GET','POST'])
 def webhook():
     if request.method == 'POST':
-        content_type = request.headers.get('Content-Type')
-        if content_type == 'application/json':
-            data = request.get_json()
-            if data and 'update_id' in data:
-                if 'message' in data:
-                    chat_id = data['message']['chat']['id']
-                    message = data['message']['text']
-                    print("Received message from chat_id", chat_id, ':', message)
-                return 'Telegram message processed', 200
+        try:
+            content_type = request.headers.get('Content-Type')
+            if content_type == 'application/json':
+                data = request.get_json()
+                if data and 'update_id' in data:
+                    if 'message' in data:
+                        chat_id = data['message']['chat']['id']
+                        message = data['message']['text']
+                        print("Received message from chat_id", chat_id, ':', message)
+                    return 'Telegram message processed', 200
+                return 'success', 200
+            
+            # Standard alert
+            data = request.get_data(as_text=True)
+            if data:
+                Alert(data)
             return 'success', 200
-        
-        # Standard alert
-        data = request.get_data(as_text=True)
-        Alert(data)
-        return 'success', 200
+        except Exception as e:
+            print(f"Error processing webhook: {e}")
+            return 'error', 500
     
     if request.method == 'GET':
-        response = request.args.get('response')
-        if(response == None):
-            msg = generatePositionsString()
-            return app.response_class(f"<pre>{msg}</pre>", mimetype='text/html; charset=utf-8')
-        
-        if response == 'whook':
-            return 'WHOOKITYWOOK'
-        
-        return 'Not found'
+        try:
+            response = request.args.get('response')
+            if(response == None):
+                msg = generatePositionsString()
+                return app.response_class(f"<pre>{msg}</pre>", mimetype='text/html; charset=utf-8')
+            
+            if response == 'whook':
+                return 'WHOOKITYWOOK'
+            
+            return 'Not found'
+        except Exception as e:
+            print(f"Error processing GET request: {e}")
+            return f'Error: {e}', 500
         
     else:
         abort(400)
 
-# start the webhook server
+@app.errorhandler(404)
+def not_found(error):
+    return 'WHOOK Bot - Endpoint not found', 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return 'WHOOK Bot - Internal server error', 500
+
+# Start the webhook server
 if __name__ == '__main__':
-    print(" * Listening on port", PORT)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    print(f" * Starting Flask server on port {PORT}")
+    print(f" * Health check available at /health")
+    print(f" * Webhook available at /whook")
+    print(f" * Ready to receive alerts!")
+    print('----------------------------')
+    
+    try:
+        app.run(host="0.0.0.0", port=PORT, debug=False)
+    except Exception as e:
+        print(f"Failed to start server: {e}")
