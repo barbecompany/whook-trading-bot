@@ -1,0 +1,10 @@
+[
+    {
+        "ACCOUNT_ID": "Barbatrax",
+        "EXCHANGE": "bitget",
+        "API_KEY": "bg_ef55ff21c24361c46aef4709d0432a57",
+        "SECRET_KEY": "c6bb3eae40e30ef969a293d4d2a54fa79bc40ffc58baa30f1453faf4d54ef012", 
+        "PASSWORD": "12345678",
+        "MARGIN_MODE": "isolated"
+    }
+]
