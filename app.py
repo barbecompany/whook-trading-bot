@@ -119,7 +119,7 @@ class RepeatTimer(Timer):
         while not self.finished.wait(self.interval):
             self.function(*self.args, **self.kwargs)
 
-# Simplified account class for Koyeb
+# Multi-TimeFrame Account Class with $ and % support
 class account_c:
     def __init__(self, exchange=None, name='default', apiKey=None, secret=None, password=None, marginMode=None, settleCoin=None):
         self.accountName = name
@@ -295,13 +295,16 @@ class account_c:
             self.print(" * E: Couldn't fetch balance: Cancelling", e)
             return
 
-        # Parse alert message
+        # Parse alert message with advanced format ($ amounts OR % percentages)
         tokens = alert['alert'].split()
         symbol = None
         command = None
         amount = None
+        amount_type = "fixed"  # "fixed" for $amount, "percentage" for %
+        timeframe = None
+        leverage = None
 
-        for token in tokens:
+        for i, token in enumerate(tokens):
             if(self.findSymbolFromPairName(token) != None):
                 symbol = self.findSymbolFromPairName(token)
             elif token.lower() == "buy":
@@ -313,8 +316,25 @@ class account_c:
             elif token.startswith('$'):
                 try:
                     amount = float(token[1:])
+                    amount_type = "fixed"
                 except:
                     amount = None
+            # Parse percentage (5%, 10%, 100%)
+            elif token.endswith('%'):
+                try:
+                    amount = float(token[:-1])
+                    amount_type = "percentage"
+                except:
+                    amount = None
+            # Parse timeframe (15m, 1h, 4h, 1d)
+            elif token.lower() in ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d']:
+                timeframe = token.lower()
+            # Parse leverage (2x, 5x, 10x, etc.)
+            elif token.lower().endswith('x') and token[:-1].replace('.', '').isdigit():
+                try:
+                    leverage = float(token[:-1])
+                except:
+                    leverage = None
 
         if not symbol:
             self.print(" * E: Symbol not found in alert")
@@ -324,22 +344,55 @@ class account_c:
             self.print(" * E: Command not found in alert")
             return
 
-        # Handle close command
+        # Set defaults if not specified
+        if timeframe is None:
+            timeframe = "15m"  # Default timeframe
+        if leverage is None:
+            leverage = 1.0     # Default leverage (no leverage)
+
+        # Calculate actual amount based on type
+        if amount_type == "percentage":
+            try:
+                available_balance = self.fetchAvailableBalance()
+                calculated_amount = (available_balance * amount) / 100
+                self.print(f" * Percentage: {amount}% of ${available_balance:.2f} = ${calculated_amount:.2f}")
+                amount = calculated_amount
+            except Exception as e:
+                self.print(f" * E: Could not calculate percentage amount: {e}")
+                return
+        elif amount_type == "fixed":
+            self.print(f" * Fixed amount: ${amount}")
+
+        self.print(f" * Parsed: {command} {symbol} ${amount:.2f} TF:{timeframe} LEV:{leverage}x")
+
+        # Handle close command with timeframe-specific logic
         if command == 'close':
             try:
                 self.refreshPositions(False)
+                closed_any = False
+                
+                # If timeframe specified in close command, add logic for position tracking
+                if timeframe and timeframe != "15m":  # For now, only close all positions
+                    self.print(f" * Close command for {timeframe} - Currently closes all {symbol} positions")
+                
                 for position in self.positionslist:
                     if position.get('symbol') == symbol:
                         contracts = position.get('contracts', 0.0)
                         side = position.get('side', '')
+                        
+                        # For now, close all positions of the symbol
+                        # TODO: Implement position tracking by timeframe
                         if side == 'long':
                             result = self.exchange.create_order(symbol, 'market', 'sell', contracts)
-                            self.print(f" * Close order successful: {symbol} sell {contracts}")
+                            self.print(f" * Close LONG: {symbol} sell {contracts} [TF:{timeframe if timeframe else 'all'}]")
+                            closed_any = True
                         elif side == 'short':
                             result = self.exchange.create_order(symbol, 'market', 'buy', contracts)
-                            self.print(f" * Close order successful: {symbol} buy {contracts}")
-                        return
-                self.print(f" * No position found to close for {symbol}")
+                            self.print(f" * Close SHORT: {symbol} buy {contracts} [TF:{timeframe if timeframe else 'all'}]")
+                            closed_any = True
+                
+                if not closed_any:
+                    self.print(f" * No position found to close for {symbol}")
                 return
             except Exception as e:
                 self.print(f" * E: Close order failed: {e}")
@@ -349,14 +402,24 @@ class account_c:
             self.print(" * E: Amount not found in alert")
             return
 
-        # Execute buy/sell order
+        # Set leverage before creating order
+        try:
+            if leverage > 1.0:
+                # Set leverage for the symbol
+                self.exchange.set_leverage(leverage, symbol)
+                self.print(f" * Leverage set to {leverage}x for {symbol}")
+        except Exception as e:
+            self.print(f" * W: Could not set leverage: {e}")
+
+        # Execute buy/sell order with leverage consideration
         try:
             price = self.fetchAveragePrice(symbol)
             if price <= 0:
                 self.print(" * E: Invalid price")
                 return
                 
-            quantity = self.contractsFromUSDT(symbol, amount, price, 1)
+            # Calculate quantity with leverage
+            quantity = self.contractsFromUSDT(symbol, amount, price, leverage)
             
             if quantity <= 0:
                 self.print(" * E: Invalid quantity calculated")
@@ -375,10 +438,10 @@ class account_c:
             
             if command == 'buy':
                 result = self.exchange.create_order(symbol, 'market', 'buy', quantity)
-                self.print(f" * Buy order successful: {symbol} buy {quantity} at price {price}")
+                self.print(f" * BUY: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
             elif command == 'sell':
                 result = self.exchange.create_order(symbol, 'market', 'sell', quantity)
-                self.print(f" * Sell order successful: {symbol} sell {quantity} at price {price}")
+                self.print(f" * SELL: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
                 
         except Exception as e:
             self.print(f" * E: Order failed: {e}")
@@ -440,18 +503,69 @@ def generatePositionsString()->str:
                 except:
                     balanceString = ' * Balance: Unable to fetch'
 
-            msg += '---------------------\n'
-            msg += f'Refreshing positions {account.accountName}: {numPositions} positions found{balanceString}\n'
+            msg += '=====================\n'
+            msg += f'🤖 MULTI-TF BOT STATUS - {account.accountName}\n'
+            msg += f'Positions: {numPositions}{balanceString}\n'
+            msg += '=====================\n'
             
             if numPositions > 0:
+                # Group positions by symbol for better display
+                symbol_positions = {}
+                total_pnl = 0
+                
                 for position in account.positionslist:
                     symbol = position.get('symbol', 'Unknown')
                     side = position.get('side', 'Unknown')
                     contracts = position.get('contracts', 0.0)
                     unrealizedPnl = position.get('unrealizedPnl', 0.0)
-                    msg += f"{symbol} * {side} * {contracts} * {unrealizedPnl:.2f}$\n"
+                    percentage = position.get('percentage', 0.0)
+                    markPrice = position.get('markPrice', 0.0)
+                    
+                    total_pnl += unrealizedPnl
+                    
+                    if symbol not in symbol_positions:
+                        symbol_positions[symbol] = []
+                    
+                    symbol_positions[symbol].append({
+                        'side': side,
+                        'contracts': contracts,
+                        'pnl': unrealizedPnl,
+                        'percentage': percentage,
+                        'price': markPrice
+                    })
+                
+                # Display positions grouped by symbol
+                for symbol, positions in symbol_positions.items():
+                    msg += f'\n📊 {symbol}:\n'
+                    symbol_pnl = 0
+                    
+                    for pos in positions:
+                        side_emoji = "🟢" if pos['side'] == 'long' else "🔴"
+                        pnl_emoji = "💚" if pos['pnl'] >= 0 else "💔"
+                        
+                        msg += f'  {side_emoji} {pos["side"].upper()}: {pos["contracts"]:.4f} '
+                        msg += f'| {pnl_emoji} {pos["pnl"]:.2f}$ ({pos["percentage"]:.2f}%)\n'
+                        symbol_pnl += pos['pnl']
+                    
+                    msg += f'  💰 Symbol P&L: {symbol_pnl:.2f}$\n'
+                
+                msg += f'\n🎯 TOTAL P&L: {total_pnl:.2f}$\n'
+                
+                # P&L Performance indicator
+                if total_pnl > 0:
+                    msg += f'📈 Portfolio Status: PROFITABLE (+{total_pnl:.2f}$)\n'
+                elif total_pnl < 0:
+                    msg += f'📉 Portfolio Status: DRAWDOWN ({total_pnl:.2f}$)\n'
+                else:
+                    msg += f'➡️ Portfolio Status: BREAKEVEN\n'
+            else:
+                msg += '💤 No active positions\n'
+                msg += '⏳ Waiting for signals from strategies...\n'
+            
+            msg += '=====================\n\n'
+            
         except Exception as e:
-            msg += f'Error refreshing positions for {account.accountName}: {e}\n'
+            msg += f'❌ Error refreshing positions for {account.accountName}: {e}\n'
 
     return msg
 
@@ -460,7 +574,7 @@ def generatePositionsString()->str:
 ###################
 
 print('----------------------------')
-print('Starting WHOOK Bot for Koyeb...')
+print('Starting WHOOK Multi-TimeFrame Bot for Koyeb...')
 
 # Initialize Flask app first
 app = Flask(__name__)
@@ -552,7 +666,7 @@ print(f"Successfully initialized {successful_accounts} out of {len(accounts_data
 @app.route('/', methods=['GET'])
 def home():
     """Health check endpoint"""
-    return f'WHOOK Bot is running! {successful_accounts} accounts active.', 200
+    return f'WHOOK Multi-TimeFrame Bot is running! {successful_accounts} accounts active.', 200
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -593,6 +707,28 @@ def webhook():
             if response == 'whook':
                 return 'WHOOKITYWOOK'
             
+            if response == 'status':
+                # Strategy status endpoint
+                status_msg = "🤖 MULTI-TIMEFRAME BOT STATUS\n"
+                status_msg += "=" * 50 + "\n"
+                status_msg += f"⏰ Server Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                status_msg += f"🔗 Active Accounts: {len(accounts)}\n"
+                status_msg += f"📊 Supported Timeframes: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d\n"
+                status_msg += f"⚡ Leverage Support: 1x - 100x\n"
+                status_msg += f"💱 Markets: {len(accounts[0].markets) if accounts else 0} active pairs\n"
+                status_msg += "\n🎯 ALERT FORMATS:\n"
+                status_msg += "AccountName action SYMBOL amount [timeframe] [leverage]\n\n"
+                status_msg += "💰 AMOUNT FORMATS:\n"
+                status_msg += "• Fixed Amount: $50, $100, $200\n"
+                status_msg += "• Percentage: 5%, 10%, 25%, 100%\n\n"
+                status_msg += "📝 EXAMPLES:\n"
+                status_msg += "• Barbatrax buy BTCUSDT $50 15m 10x\n"
+                status_msg += "• Barbatrax buy ETHUSDT 5% 4h 5x\n"
+                status_msg += "• Barbatrax sell SOLUSDT 10% 1h 3x\n"
+                status_msg += "• Barbatrax buy ADAUSDT 100% 1d 1x\n"
+                status_msg += "• Barbatrax close BTCUSDT\n"
+                return app.response_class(f"<pre>{status_msg}</pre>", mimetype='text/html; charset=utf-8')
+            
             return 'Not found'
         except Exception as e:
             print(f"Error processing GET request: {e}")
@@ -603,18 +739,19 @@ def webhook():
 
 @app.errorhandler(404)
 def not_found(error):
-    return 'WHOOK Bot - Endpoint not found', 404
+    return 'WHOOK Multi-TimeFrame Bot - Endpoint not found', 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return 'WHOOK Bot - Internal server error', 500
+    return 'WHOOK Multi-TimeFrame Bot - Internal server error', 500
 
 # Start the webhook server
 if __name__ == '__main__':
     print(f" * Starting Flask server on port {PORT}")
     print(f" * Health check available at /health")
     print(f" * Webhook available at /whook")
-    print(f" * Ready to receive alerts!")
+    print(f" * Status available at /whook?response=status")
+    print(f" * Multi-TimeFrame Bot ready to receive alerts!")
     print('----------------------------')
     
     try:
