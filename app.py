@@ -1,763 +1,178 @@
-import ccxt
-from flask import Flask, request, abort
-from werkzeug.middleware.proxy_fix import ProxyFix
-from threading import Timer
+from flask import Flask, request
 import os
-import time
+import ccxt
 import json
-import copy
-import logging
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
-from pprint import pprint
+from threading import Thread
+import requests
+import time
 
-
-def fixVersionFormat(version)->str:
-    vl = version.split(".")
-    return f'{vl[0]}.{vl[1]}.{vl[2].zfill(3)}'
-
-minCCXTversion = '4.2.82'
-CCXTversion = fixVersionFormat(ccxt.__version__)
-print('CCXT Version:', ccxt.__version__)
-if(CCXTversion < fixVersionFormat(minCCXTversion)):
-    print('\n============== * WARNING * ==============')
-    print('WHOOK requires CCXT version', minCCXTversion,' or higher.')
-    print('While it may run with earlier versions wrong behaviors are expected to happen.')
-    print('Please update CCXT.')
-    print('============== * WARNING * ==============\n')
-    
-
-###################
-##### Globals #####
-###################
-
-verbose = False
-debug_order = False
-SHOW_BALANCE = False
-SHOW_LIQUIDATION = False
-SHOW_BREAKEVEN = True
-SHOW_REALIZEDPNL = False
-SHOW_ENTRYPRICE = False
-USE_PROXY = False
-PORT = int(os.environ.get('PORT', 8080))  # Koyeb compatibility
-PROXY_PORT = 50000
-ALERT_TIMEOUT = 60 * 3
-ORDER_TIMEOUT = 40
-REFRESH_POSITIONS_FREQUENCY = 5 * 60
-UPDATE_ORDERS_FREQUENCY = 0.25
-LOGS_DIRECTORY = 'logs'
-MARGIN_MODE_NONE = '------'
-
-#### Open config file #####
-
-def writeConfig():
-    config_data = {
-        "ALERT_TIMEOUT": ALERT_TIMEOUT,
-        "ORDER_TIMEOUT": ORDER_TIMEOUT,
-        "REFRESH_POSITIONS_FREQUENCY": REFRESH_POSITIONS_FREQUENCY,
-        "UPDATE_ORDERS_FREQUENCY": UPDATE_ORDERS_FREQUENCY,
-        "VERBOSE": verbose,
-        "SHOW_BALANCE": SHOW_BALANCE,
-        "SHOW_REALIZEDPNL": SHOW_REALIZEDPNL,
-        "SHOW_ENTRYPRICE": SHOW_ENTRYPRICE,
-        "SHOW_LIQUIDATION": SHOW_LIQUIDATION,
-        "SHOW_BREAKEVEN": SHOW_BREAKEVEN,
-        "LOGS_DIRECTORY": LOGS_DIRECTORY,
-        "USE_PROXY": USE_PROXY,
-        "PROXY_PORT": PROXY_PORT
-    }
-    
-    try:
-        with open('config.json', 'w') as f:
-            json.dump([config_data], f, indent=2)
-    except Exception as e:
-        print(f"Warning: Could not write config file: {e}")
-
-try:
-    with open('config.json', 'r') as config_file:
-        config = json.load(config_file)[0]
-except FileNotFoundError:
-    writeConfig()
-    print("Config file created.\n----------------------------")
-except Exception as e:
-    print(f"Warning: Could not read config file: {e}")
-    writeConfig()
-else:
-    # Parse config
-    try:
-        globals().update({k: v for k, v in config.items() if k in globals()})
-        writeConfig()
-    except Exception as e:
-        print(f"Warning: Could not update config: {e}")
-
-
-##### Utils #####
-
-def dateString():
-    return datetime.today().strftime("%Y/%m/%d")
-
-def timeNow():
-    return time.strftime("%H:%M:%S")
-
-def roundUpTick(value: float, tick: str):
-    if type(tick) is not str: tick = str(tick)
-    if type(value) is not Decimal: value = Decimal(value)
-    return float(value.quantize(Decimal(tick), ROUND_CEILING))
-
-def roundDownTick(value: float, tick: str):
-    if type(tick) is not str: tick = str(tick)
-    if type(value) is not Decimal: value = Decimal(value)
-    return float(value.quantize(Decimal(tick), ROUND_FLOOR))
-
-def roundToTick(value: float, tick: float):
-    if type(tick) is not str: tick = str(tick)
-    if type(value) is not Decimal: value = Decimal(value)
-    return float(value.quantize(Decimal(tick), ROUND_HALF_EVEN))
-
-class RepeatTimer(Timer):
-    def run(self):
-        while not self.finished.wait(self.interval):
-            self.function(*self.args, **self.kwargs)
-
-# Multi-TimeFrame Account Class with FIXED CLOSE support
-class account_c:
-    def __init__(self, exchange=None, name='default', apiKey=None, secret=None, password=None, marginMode=None, settleCoin=None):
-        self.accountName = name
-        self.positionslist = []
-        self.MARGIN_MODE = 'cross' if (marginMode != None and marginMode.lower() == 'cross') else 'isolated'
-        self.SETTLE_COIN = 'USDT' if(settleCoin == None) else settleCoin
-        self.markets = {}
-        self.exchange = None
-
-        if(exchange == None):
-            print(f"Error: Exchange not defined for account {name}")
-            return
-        
-        try:
-            if(exchange.lower() == 'bitget'):
-                self.exchange = ccxt.bitget({
-                    "apiKey": apiKey,
-                    "secret": secret,
-                    'password': password,
-                    "options": {'defaultType': 'swap', 'defaultMarginMode': self.MARGIN_MODE, 'adjustForTimeDifference': True},
-                    "enableRateLimit": True,  # Enabled rate limiting for stability
-                    "timeout": 30000,  # 30 second timeout
-                })
-            else:
-                print(f"Error: Unsupported exchange {exchange} for account {name}")
-                return
-        except Exception as e:
-            print(f"Error creating exchange for account {name}: {e}")
-            return
-
-        if(self.exchange == None):
-            print(f"Error: Exchange creation failed for account {name}")
-            return
-        
-        # Load basic markets info with error handling
-        try:
-            print(f"Loading markets for account {name}...")
-            markets = self.exchange.load_markets()
-            for key, market in markets.items():
-                if market.get('settle') == self.SETTLE_COIN:
-                    self.markets[key] = market
-            print(f"Loaded {len(self.markets)} markets for account {name}")
-        except Exception as e:
-            print(f"Warning: Error loading markets for account {name}: {e}")
-            print(f"Account {name} will continue with limited functionality")
-            
-        # Initial position refresh with error handling
-        try:
-            self.refreshPositions(True)
-        except Exception as e:
-            print(f"Warning: Initial position refresh failed for account {name}: {e}")
-
-    def print(self, *args, sep=" ", **kwargs):
-        exchange_id = self.exchange.id if self.exchange else 'unknown'
-        print(timeNow(), '['+ self.accountName +'/'+ exchange_id +']', *args, sep=sep, **kwargs)
-
-    def fetchBalance(self):
-        if not self.exchange:
-            return {'free': 0.0, 'used': 0.0, 'total': 0.0}
-            
-        try:
-            params = {"settle": self.SETTLE_COIN}
-            response = self.exchange.fetch_balance(params)
-            if(response.get(self.SETTLE_COIN) == None):
-                return {'free': 0.0, 'used': 0.0, 'total': 0.0}
-            return response.get(self.SETTLE_COIN)
-        except Exception as e:
-            print(f"Error fetching balance for {self.accountName}: {e}")
-            return {'free': 0.0, 'used': 0.0, 'total': 0.0}
-
-    def fetchAvailableBalance(self)->float:
-        return float(self.fetchBalance().get('free'))
-
-    def fetchAveragePrice(self, symbol)->float:
-        if not self.exchange:
-            return 0.0
-            
-        try:
-            orderbook = self.exchange.fetch_order_book(symbol)
-            bid = orderbook['bids'][0][0] if len(orderbook['bids']) > 0 else None
-            ask = orderbook['asks'][0][0] if len(orderbook['asks']) > 0 else None
-            if(bid == None and ask == None):
-                raise ValueError("Couldn't fetch orderbook")
-            if(bid == None): bid = ask
-            if(ask == None): ask = bid
-            return (bid + ask) * 0.5
-        except Exception as e:
-            print(f"Error fetching price for {symbol}: {e}")
-            return 0.0
-
-    def findSymbolFromPairName(self, pairString):
-        paircmd = pairString.upper()
-        if(paircmd.endswith('.P')):
-            paircmd = paircmd[:-2]
-
-        if '/' not in paircmd and paircmd.endswith(self.SETTLE_COIN):
-            paircmd = paircmd[:-len(self.SETTLE_COIN)]
-            paircmd += '/' + self.SETTLE_COIN + ':' + self.SETTLE_COIN
-
-        if '/' in paircmd and not paircmd.endswith(':' + self.SETTLE_COIN):
-            paircmd += ':' + self.SETTLE_COIN
-
-        if paircmd in self.markets:
-            return paircmd
-
-        for symbol in self.markets:
-            if symbol == paircmd:
-                return symbol
-        return None
-
-    def contractsFromUSDT(self, symbol, amount, price, leverage=1.0)->float:
-        try:
-            if symbol not in self.markets:
-                return 0.0
-            contractSize = self.markets[symbol].get('contractSize', 1.0)
-            if contractSize is None:
-                contractSize = 1.0
-            return (amount * leverage) / (contractSize * price)
-        except Exception as e:
-            print(f"Error calculating contracts: {e}")
-            return 0.0
-
-    def refreshPositions(self, v=verbose):
-        if not self.exchange:
-            self.positionslist = []
-            return
-            
-        try:
-            symbols = list(self.markets.keys()) if self.markets else None
-            positions = self.exchange.fetch_positions(symbols, params={'settle': self.SETTLE_COIN})
-            
-            # Filter active positions
-            activePositions = []
-            for position in positions:
-                if position.get('contracts', 0.0) != 0.0:
-                    activePositions.append(position)
-            
-            self.positionslist = activePositions
-            
-            if v:
-                numPositions = len(activePositions)
-                print('------------------------------')
-                if SHOW_BALANCE:
-                    balance = self.fetchBalance()
-                    print(f"  {numPositions} positions found. Balance: {balance['total']:.2f}$ - Available {balance['free']:.2f}$")
-                else:
-                    print(f"  {numPositions} positions found.")
-                
-                for position in activePositions:
-                    symbol = position.get('symbol', 'Unknown')
-                    side = position.get('side', 'Unknown')
-                    contracts = position.get('contracts', 0.0)
-                    unrealizedPnl = position.get('unrealizedPnl', 0.0)
-                    print(f"  {symbol} * {side} * {contracts} * {unrealizedPnl:.2f}$")
-                print('------------------------------')
-                
-        except Exception as e:
-            print(f"Error refreshing positions for {self.accountName}: {e}")
-            self.positionslist = []
-
-    def proccessAlert(self, alert: dict):
-        if not self.exchange:
-            self.print(" * E: Exchange not available")
-            return
-            
-        self.print(' ')
-        self.print(" ALERT:", alert['alert'])
-        self.print('----------------------------')
-
-        # Parse alert message with multi-timeframe support
-        tokens = alert['alert'].split()
-        symbol = None
-        command = None
-        amount = None
-        amount_type = "fixed"  # "fixed" for $amount, "percentage" for %
-        timeframe = None
-        leverage = None
-
-        for i, token in enumerate(tokens):
-            if(self.findSymbolFromPairName(token) != None):
-                symbol = self.findSymbolFromPairName(token)
-            elif token.lower() == "buy":
-                command = 'buy'
-            elif token.lower() == "sell":
-                command = 'sell'
-            elif token.lower() == "close":
-                command = 'close'
-            elif token.startswith('$'):
-                try:
-                    amount = float(token[1:])
-                    amount_type = "fixed"
-                except:
-                    amount = None
-            # Parse percentage (5%, 10%, 100%)
-            elif token.endswith('%'):
-                try:
-                    amount = float(token[:-1])
-                    amount_type = "percentage"
-                except:
-                    amount = None
-            # Parse timeframe (15m, 1h, 4h, 1d)
-            elif token.lower() in ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d']:
-                timeframe = token.lower()
-            # Parse leverage (2x, 5x, 10x, etc.)
-            elif token.lower().endswith('x') and token[:-1].replace('.', '').isdigit():
-                try:
-                    leverage = float(token[:-1])
-                except:
-                    leverage = None
-
-        if not symbol:
-            self.print(" * E: Symbol not found in alert")
-            return
-            
-        if not command:
-            self.print(" * E: Command not found in alert")
-            return
-
-        # Set defaults if not specified
-        if timeframe is None:
-            timeframe = "15m"  # Default timeframe
-        if leverage is None:
-            leverage = 1.0     # Default leverage (no leverage)
-
-        # ✅ FIXED CLOSE COMMAND - No amount needed!
-        if command == 'close':
-            try:
-                self.print(f" * CLOSE command for {symbol} TF:{timeframe}")
-                self.refreshPositions(False)
-                closed_any = False
-                
-                for position in self.positionslist:
-                    if position.get('symbol') == symbol:
-                        contracts = position.get('contracts', 0.0)
-                        side = position.get('side', '')
-                        
-                        if side == 'long':
-                            result = self.exchange.create_order(symbol, 'market', 'sell', contracts)
-                            self.print(f" * ✅ CLOSE LONG: {symbol} sell {contracts} [TF:{timeframe}]")
-                            closed_any = True
-                        elif side == 'short':
-                            result = self.exchange.create_order(symbol, 'market', 'buy', contracts)
-                            self.print(f" * ✅ CLOSE SHORT: {symbol} buy {contracts} [TF:{timeframe}]")
-                            closed_any = True
-                
-                if not closed_any:
-                    self.print(f" * No position found to close for {symbol}")
-                return  # ✅ Early return - no need to check amount
-            except Exception as e:
-                self.print(f" * E: Close order failed: {e}")
-                return
-
-        # For buy/sell commands, we need amount
-        if not amount:
-            self.print(" * E: Amount not found in alert")
-            return
-
-        # Get available balance for percentage calculation
-        try:
-            available = self.fetchAvailableBalance() * 0.985
-        except Exception as e:
-            self.print(" * E: Couldn't fetch balance: Cancelling", e)
-            return
-
-        # Calculate actual amount based on type
-        if amount_type == "percentage":
-            try:
-                available_balance = self.fetchAvailableBalance()
-                calculated_amount = (available_balance * amount) / 100
-                self.print(f" * Percentage: {amount}% of ${available_balance:.2f} = ${calculated_amount:.2f}")
-                amount = calculated_amount
-            except Exception as e:
-                self.print(f" * E: Could not calculate percentage amount: {e}")
-                return
-        elif amount_type == "fixed":
-            self.print(f" * Fixed amount: ${amount}")
-
-        self.print(f" * Parsed: {command} {symbol} ${amount:.2f} TF:{timeframe} LEV:{leverage}x")
-
-        # Set leverage before creating order
-        try:
-            if leverage > 1.0:
-                # Set leverage for the symbol
-                self.exchange.set_leverage(leverage, symbol)
-                self.print(f" * Leverage set to {leverage}x for {symbol}")
-        except Exception as e:
-            self.print(f" * W: Could not set leverage: {e}")
-
-        # Execute buy/sell order with leverage consideration
-        try:
-            price = self.fetchAveragePrice(symbol)
-            if price <= 0:
-                self.print(" * E: Invalid price")
-                return
-                
-            # Calculate quantity with leverage
-            quantity = self.contractsFromUSDT(symbol, amount, price, leverage)
-            
-            if quantity <= 0:
-                self.print(" * E: Invalid quantity calculated")
-                return
-            
-            # Check minimum order size
-            minQty = 0.0001  # Basic minimum for most pairs
-            if symbol in self.markets:
-                minAmount = self.markets[symbol].get('limits', {}).get('amount', {}).get('min', minQty)
-                if minAmount:
-                    minQty = minAmount
-            
-            if quantity < minQty:
-                self.print(f" * E: Order too small: {quantity} < {minQty}")
-                return
-            
-            if command == 'buy':
-                result = self.exchange.create_order(symbol, 'market', 'buy', quantity)
-                self.print(f" * ✅ BUY: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
-            elif command == 'sell':
-                result = self.exchange.create_order(symbol, 'market', 'sell', quantity)
-                self.print(f" * ✅ SELL: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
-                
-        except Exception as e:
-            self.print(f" * E: Order failed: {e}")
-
-accounts = []
-
-def Alert(data):
-    if not accounts:
-        print(timeNow(), ' * E: No accounts available')
-        return
-        
-    account = None
-    lines = data.split("\n")
-    for line in lines:
-        line = line.rstrip('\n')
-        if(len(line) == 0):
-            continue
-        if(line[:2] == '//'):
-            continue
-        
-        tokens = line.split()
-        for token in tokens:
-            for a in accounts:
-                if(token.lower() == a.accountName.lower()):
-                    account = a
-                    break
-        
-        if(account == None): 
-            print(timeNow(), ' * E: Account ID not found. ALERT:', line)
-            continue
-        
-        alert = {
-            'alert': line.replace('\n', ''),
-            'timestamp': time.monotonic()
-        }
-        
-        account.proccessAlert(alert)
-
-def refreshPositions():
-    for account in accounts:
-        if account.exchange:
-            account.refreshPositions()
-
-def generatePositionsString()->str:
-    msg = ''
-    for account in accounts:
-        if not account.exchange:
-            msg += f'---------------------\nAccount {account.accountName}: Exchange not available\n'
-            continue
-            
-        try:
-            account.refreshPositions()
-            numPositions = len(account.positionslist)
-            balanceString = ''
-            if SHOW_BALANCE:
-                try:
-                    balance = account.fetchBalance()
-                    balanceString = f" * Balance: {balance['total']:.2f}$ - Available {balance['free']:.2f}$"
-                except:
-                    balanceString = ' * Balance: Unable to fetch'
-
-            msg += '=====================\n'
-            msg += f'🤖 WHOOK MULTI-TF BOT - {account.accountName}\n'
-            msg += f'Positions: {numPositions}{balanceString}\n'
-            msg += '=====================\n'
-            
-            if numPositions > 0:
-                # Group positions by symbol for better display
-                symbol_positions = {}
-                total_pnl = 0
-                
-                for position in account.positionslist:
-                    symbol = position.get('symbol', 'Unknown')
-                    side = position.get('side', 'Unknown')
-                    contracts = position.get('contracts', 0.0)
-                    unrealizedPnl = position.get('unrealizedPnl', 0.0)
-                    percentage = position.get('percentage', 0.0)
-                    markPrice = position.get('markPrice', 0.0)
-                    
-                    total_pnl += unrealizedPnl
-                    
-                    if symbol not in symbol_positions:
-                        symbol_positions[symbol] = []
-                    
-                    symbol_positions[symbol].append({
-                        'side': side,
-                        'contracts': contracts,
-                        'pnl': unrealizedPnl,
-                        'percentage': percentage,
-                        'price': markPrice
-                    })
-                
-                # Display positions grouped by symbol
-                for symbol, positions in symbol_positions.items():
-                    msg += f'\n📊 {symbol}:\n'
-                    symbol_pnl = 0
-                    
-                    for pos in positions:
-                        side_emoji = "🟢" if pos['side'] == 'long' else "🔴"
-                        pnl_emoji = "💚" if pos['pnl'] >= 0 else "💔"
-                        
-                        msg += f'  {side_emoji} {pos["side"].upper()}: {pos["contracts"]:.4f} '
-                        msg += f'| {pnl_emoji} {pos["pnl"]:.2f}$ ({pos["percentage"]:.2f}%)\n'
-                        symbol_pnl += pos['pnl']
-                    
-                    msg += f'  💰 Symbol P&L: {symbol_pnl:.2f}$\n'
-                
-                msg += f'\n🎯 TOTAL P&L: {total_pnl:.2f}$\n'
-                
-                # P&L Performance indicator
-                if total_pnl > 0:
-                    msg += f'📈 Portfolio Status: PROFITABLE (+{total_pnl:.2f}$)\n'
-                elif total_pnl < 0:
-                    msg += f'📉 Portfolio Status: DRAWDOWN ({total_pnl:.2f}$)\n'
-                else:
-                    msg += f'➡️ Portfolio Status: BREAKEVEN\n'
-            else:
-                msg += '💤 No active positions\n'
-                msg += '⏳ Waiting for signals from strategies...\n'
-            
-            msg += '=====================\n\n'
-            
-        except Exception as e:
-            msg += f'❌ Error refreshing positions for {account.accountName}: {e}\n'
-
-    return msg
-
-###################
-#### Initialize ###
-###################
-
-print('----------------------------')
-print('Starting WHOOK Multi-TimeFrame Bot with FIXED CLOSE...')
-
-# Initialize Flask app first
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Silence Flask logging
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-log.disabled = True
+LOGS_DIRECTORY = "logs"
+ACCOUNTS_FILE = "accounts.json"
+CONFIG_FILE = "config.json"
 
-#### Load accounts file with better error handling ###
+if not os.path.exists(LOGS_DIRECTORY):
+    os.makedirs(LOGS_DIRECTORY)
 
-accounts_data = []
-try:
-    with open('accounts.json', 'r') as accounts_file:
-        accounts_data = json.load(accounts_file)
-        print(f"Loaded {len(accounts_data)} account configurations")
-except FileNotFoundError:
-    print("Warning: File 'accounts.json' not found.")
-    # Create a default template but don't exit
-    accounts_template = [
-        {
-            "ACCOUNT_ID": "your_account_name",
-            "EXCHANGE": "bitget",
-            "API_KEY": "your_api_key",
-            "SECRET_KEY": "your_secret_key",
-            "PASSWORD": "your_API_password",
-            "MARGIN_MODE": "isolated"
-        }
-    ]
-    try:
-        with open('accounts.json', 'w') as f:
-            json.dump(accounts_template, f, indent=2)
-        print("Template 'accounts.json' created.")
-    except Exception as e:
-        print(f"Could not create template: {e}")
-except Exception as e:
-    print(f"Error reading accounts.json: {e}")
+class account_c:
+    def __init__(self, key, secret, password):
+        self.exchange = ccxt.bitget({
+            'apiKey': key,
+            'secret': secret,
+            'password': password,
+            'enableRateLimit': True,
+        })
+        self.exchange.set_sandbox_mode(False)
 
-# Process accounts with better error handling
-successful_accounts = 0
-for ac in accounts_data:
-    try:
-        exchange = ac.get('EXCHANGE')
-        if(exchange == None):
-            print(" * ERROR PARSING ACCOUNT: Missing EXCHANGE")
-            continue
+    def parse(self, symbol):
+        market = self.exchange.market(symbol)
+        self.base = market['base']
+        self.quote = market['quote']
+        self.precision_amount = market['precision']['amount']
+        self.precision_price = market['precision']['price']
+        self.min_qty = market['limits']['amount']['min']
+        self.symbol = symbol.replace("/", "")
+        return market
 
-        account_id = ac.get('ACCOUNT_ID')
-        if(account_id == None):
-            print(" * ERROR PARSING ACCOUNT: Missing ACCOUNT_ID")
-            continue
+    def format_amount(self, amount):
+        return round(max(amount, self.min_qty), self.precision_amount)
 
-        api_key = ac.get('API_KEY')
-        if(api_key == None or api_key == "your_api_key"):
-            print(f" * ERROR PARSING ACCOUNT {account_id}: Missing or template API_KEY")
-            continue
+    def position(self):
+        positions = self.exchange.fetch_positions()
+        return {p['symbol']: p for p in positions}
 
-        secret_key = ac.get('SECRET_KEY')
-        if(secret_key == None or secret_key == "your_secret_key"):
-            print(f" * ERROR PARSING ACCOUNT {account_id}: Missing or template SECRET_KEY")
-            continue
+    def balance(self):
+        return self.exchange.fetch_balance()
 
-        password = ac.get('PASSWORD', "")
-        if password == "your_API_password":
-            password = ""
+    def create_market_order(self, symbol, side, amount, params):
+        return self.exchange.create_market_order(symbol, side, amount, params)
 
-        marginMode = ac.get('MARGIN_MODE')
-        settleCoin = ac.get('SETTLE_COIN')
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as file:
+            return json.load(file)
+    return {"active": True}
 
-        print(timeNow(), " Initializing account: [", account_id, "] in [", exchange, ']')
-        account = account_c(exchange, account_id, api_key, secret_key, password, marginMode, settleCoin)
-        
-        # Only add account if exchange was successfully created
-        if account.exchange is not None:
-            accounts.append(account)
-            successful_accounts += 1
-            print(f" * Account {account_id} initialized successfully")
-        else:
-            print(f" * Account {account_id} failed to initialize")
-            
-    except Exception as e:
-        print(f'Account creation failed for {account_id if "account_id" in locals() else "unknown"}: {e}')
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as file:
+        json.dump(config, file, indent=4)
 
-print(f"Successfully initialized {successful_accounts} out of {len(accounts_data)} accounts")
+def load_accounts():
+    if os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, 'r') as file:
+            data = json.load(file)
+            return {
+                name: account_c(acc['key'], acc['secret'], acc['password'])
+                for name, acc in data.items()
+            }
+    return {}
 
-############################################
+accounts = load_accounts()
+config = load_config()
 
 @app.route('/', methods=['GET'])
-def home():
-    """Health check endpoint"""
-    return f'WHOOK Multi-TimeFrame Bot with FIXED CLOSE is running! {successful_accounts} accounts active.', 200
+def root():
+    return "Bot attivo"
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint for Koyeb"""
-    return 'OK', 200
+@app.route('/config', methods=['POST'])
+def update_config():
+    new_config = request.get_json()
+    if 'active' in new_config:
+        config['active'] = new_config['active']
+        save_config(config)
+        return f"Stato bot aggiornato: {config['active']}"
+    return "Chiave 'active' mancante nel JSON", 400
 
-@app.route('/keep-alive', methods=['GET'])
-def keep_alive():
-    """Keep-alive endpoint to prevent deep sleep"""
-    return 'ALIVE', 200
-
-@app.route('/whook', methods=['GET','POST'])
+@app.route('/', methods=['POST'])
 def webhook():
-    if request.method == 'POST':
-        try:
-            content_type = request.headers.get('Content-Type')
-            if content_type == 'application/json':
-                data = request.get_json()
-                if data and 'update_id' in data:
-                    if 'message' in data:
-                        chat_id = data['message']['chat']['id']
-                        message = data['message']['text']
-                        print("Received message from chat_id", chat_id, ':', message)
-                    return 'Telegram message processed', 200
-                return 'success', 200
-            
-            # Standard alert
-            data = request.get_data(as_text=True)
-            if data:
-                Alert(data)
-            return 'success', 200
-        except Exception as e:
-            print(f"Error processing webhook: {e}")
-            return 'error', 500
-    
-    if request.method == 'GET':
-        try:
-            response = request.args.get('response')
-            if(response == None):
-                msg = generatePositionsString()
-                return app.response_class(f"<pre>{msg}</pre>", mimetype='text/html; charset=utf-8')
-            
-            if response == 'whook':
-                return 'WHOOKITYWOOK'
-            
-            if response == 'status':
-                # Strategy status endpoint
-                status_msg = "🤖 WHOOK MULTI-TIMEFRAME BOT - FIXED CLOSE\n"
-                status_msg += "=" * 50 + "\n"
-                status_msg += f"⏰ Server Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                status_msg += f"🔗 Active Accounts: {len(accounts)}\n"
-                status_msg += f"📊 Supported Timeframes: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d\n"
-                status_msg += f"⚡ Leverage Support: 1x - 100x\n"
-                status_msg += f"💱 Markets: {len(accounts[0].markets) if accounts else 0} active pairs\n"
-                status_msg += "\n🎯 ALERT FORMATS:\n"
-                status_msg += "AccountName action SYMBOL amount [timeframe] [leverage]\n\n"
-                status_msg += "💰 AMOUNT FORMATS:\n"
-                status_msg += "• Fixed Amount: $50, $100, $200\n"
-                status_msg += "• Percentage: 5%, 10%, 25%, 100%\n\n"
-                status_msg += "📝 EXAMPLES:\n"
-                status_msg += "• Barbatrax buy BTCUSDT $50 15m 10x\n"
-                status_msg += "• Barbatrax buy ETHUSDT 5% 4h 5x\n"
-                status_msg += "• Barbatrax sell SOLUSDT 10% 1h 3x\n"
-                status_msg += "• Barbatrax buy ADAUSDT 100% 1d 1x\n"
-                status_msg += "• Barbatrax close BTCUSDT (✅ FIXED - no amount needed!)\n"
-                return app.response_class(f"<pre>{status_msg}</pre>", mimetype='text/html; charset=utf-8')
-            
-            return 'Not found'
-        except Exception as e:
-            print(f"Error processing GET request: {e}")
-            return f'Error: {e}', 500
-        
-    else:
-        abort(400)
+    if not config.get("active", True):
+        return "Bot inattivo"
 
-@app.errorhandler(404)
-def not_found(error):
-    return 'WHOOK Multi-TimeFrame Bot with FIXED CLOSE - Endpoint not found', 404
+    data = request.get_json()
+    message = data.get("message", "")
+    if not message:
+        return "Messaggio mancante", 400
 
-@app.errorhandler(500)
-def internal_error(error):
-    return 'WHOOK Multi-TimeFrame Bot with FIXED CLOSE - Internal server error', 500
+    Thread(target=Alert, args=(message,)).start()
+    return "Messaggio ricevuto", 200
 
-# Start the webhook server
-if __name__ == '__main__':
-    print(f" * Starting Flask server on port {PORT}")
-    print(f" * Health check available at /health")
-    print(f" * Keep-alive available at /keep-alive (to prevent deep sleep)")
-    print(f" * Webhook available at /whook")
-    print(f" * Status available at /whook?response=status")
-    print(f" * WHOOK Multi-TimeFrame Bot with FIXED CLOSE ready!")
-    print('----------------------------')
-    
+def Alert(message):
     try:
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+        print(f"[{datetime.now()}] Messaggio ricevuto: {message}")
+
+        parts = message.strip().split()
+        if len(parts) < 3:
+            print("Formato messaggio errato.")
+            return
+
+        name, cmd, symbol = parts[:3]
+        amount = 0
+        tf = '15m'
+        leverage = 1
+
+        for part in parts[3:]:
+            if part.endswith('x'):
+                leverage = int(part[:-1])
+            elif part.endswith('m') or part.endswith('h'):
+                tf = part
+            elif '%' in part:
+                amount = float(part.strip('%')) / 100
+            elif part.startswith('$'):
+                amount = float(part.strip('$'))
+            elif part.replace('.', '', 1).isdigit():
+                amount = float(part)
+
+        if name not in accounts:
+            print(f"Account {name} non trovato.")
+            return
+
+        acc = accounts[name]
+        symbol = symbol.upper().replace('USDT', '/USDT')
+        market = acc.parse(symbol)
+
+        balance = acc.balance()
+        usdt_balance = balance['total'].get('USDT', 0)
+
+        qty = 0
+        if amount > 1:
+            qty = amount
+        elif amount > 0:
+            qty = (usdt_balance * amount) * leverage / market['info']['lastSz']
+        else:
+            qty = (usdt_balance * leverage) / market['info']['lastSz']
+
+        qty = acc.format_amount(qty)
+
+        if cmd.lower() == "close":
+            positions = acc.position()
+            pos = positions.get(symbol)
+            if pos and float(pos['contracts']) > 0:
+                side = 'sell' if pos['side'] == 'long' else 'buy'
+                acc.create_market_order(symbol, side, float(pos['contracts']), {"reduceOnly": True})
+                print(f"Posizione chiusa: {symbol}")
+            else:
+                print(f"Nessuna posizione attiva da chiudere per {symbol}")
+        else:
+            side = "buy" if cmd.lower() == "buy" else "sell"
+            acc.create_market_order(symbol, side, qty, {"leverage": leverage})
+            print(f"Ordine eseguito: {cmd.upper()} {symbol} Qty: {qty} Lev: {leverage}")
+
     except Exception as e:
-        print(f"Failed to start server: {e}")
+        print(f"Errore: {e}")
+
+# ✅ Keep-alive per evitare il deep sleep ogni 280 secondi
+def keep_alive():
+    while True:
+        try:
+            # ⚠️ Sostituisci con il tuo URL pubblico (es. su Replit, Fly.io, ecc.)
+            requests.get("https://tuo-bot-url.replit.app/")
+            print("[KEEP-ALIVE] Ping inviato con successo.")
+        except Exception as e:
+            print(f"[KEEP-ALIVE] Errore durante il ping: {e}")
+        time.sleep(280)
+
+if __name__ == '__main__':
+    Thread(target=keep_alive, daemon=True).start()
+    app.run(debug=False, host='0.0.0.0', port=8080)
