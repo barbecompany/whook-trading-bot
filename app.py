@@ -119,7 +119,7 @@ class RepeatTimer(Timer):
         while not self.finished.wait(self.interval):
             self.function(*self.args, **self.kwargs)
 
-# Multi-TimeFrame Account Class with $ and % support
+# Multi-TimeFrame Account Class with FIXED CLOSE support
 class account_c:
     def __init__(self, exchange=None, name='default', apiKey=None, secret=None, password=None, marginMode=None, settleCoin=None):
         self.accountName = name
@@ -289,13 +289,7 @@ class account_c:
         self.print(" ALERT:", alert['alert'])
         self.print('----------------------------')
 
-        try:
-            available = self.fetchAvailableBalance() * 0.985
-        except Exception as e:
-            self.print(" * E: Couldn't fetch balance: Cancelling", e)
-            return
-
-        # Parse alert message with advanced format ($ amounts OR % percentages)
+        # Parse alert message with multi-timeframe support
         tokens = alert['alert'].split()
         symbol = None
         command = None
@@ -350,6 +344,46 @@ class account_c:
         if leverage is None:
             leverage = 1.0     # Default leverage (no leverage)
 
+        # ✅ FIXED CLOSE COMMAND - No amount needed!
+        if command == 'close':
+            try:
+                self.print(f" * CLOSE command for {symbol} TF:{timeframe}")
+                self.refreshPositions(False)
+                closed_any = False
+                
+                for position in self.positionslist:
+                    if position.get('symbol') == symbol:
+                        contracts = position.get('contracts', 0.0)
+                        side = position.get('side', '')
+                        
+                        if side == 'long':
+                            result = self.exchange.create_order(symbol, 'market', 'sell', contracts)
+                            self.print(f" * ✅ CLOSE LONG: {symbol} sell {contracts} [TF:{timeframe}]")
+                            closed_any = True
+                        elif side == 'short':
+                            result = self.exchange.create_order(symbol, 'market', 'buy', contracts)
+                            self.print(f" * ✅ CLOSE SHORT: {symbol} buy {contracts} [TF:{timeframe}]")
+                            closed_any = True
+                
+                if not closed_any:
+                    self.print(f" * No position found to close for {symbol}")
+                return  # ✅ Early return - no need to check amount
+            except Exception as e:
+                self.print(f" * E: Close order failed: {e}")
+                return
+
+        # For buy/sell commands, we need amount
+        if not amount:
+            self.print(" * E: Amount not found in alert")
+            return
+
+        # Get available balance for percentage calculation
+        try:
+            available = self.fetchAvailableBalance() * 0.985
+        except Exception as e:
+            self.print(" * E: Couldn't fetch balance: Cancelling", e)
+            return
+
         # Calculate actual amount based on type
         if amount_type == "percentage":
             try:
@@ -364,43 +398,6 @@ class account_c:
             self.print(f" * Fixed amount: ${amount}")
 
         self.print(f" * Parsed: {command} {symbol} ${amount:.2f} TF:{timeframe} LEV:{leverage}x")
-
-        # Handle close command with timeframe-specific logic
-        if command == 'close':
-            try:
-                self.refreshPositions(False)
-                closed_any = False
-                
-                # If timeframe specified in close command, add logic for position tracking
-                if timeframe and timeframe != "15m":  # For now, only close all positions
-                    self.print(f" * Close command for {timeframe} - Currently closes all {symbol} positions")
-                
-                for position in self.positionslist:
-                    if position.get('symbol') == symbol:
-                        contracts = position.get('contracts', 0.0)
-                        side = position.get('side', '')
-                        
-                        # For now, close all positions of the symbol
-                        # TODO: Implement position tracking by timeframe
-                        if side == 'long':
-                            result = self.exchange.create_order(symbol, 'market', 'sell', contracts)
-                            self.print(f" * Close LONG: {symbol} sell {contracts} [TF:{timeframe if timeframe else 'all'}]")
-                            closed_any = True
-                        elif side == 'short':
-                            result = self.exchange.create_order(symbol, 'market', 'buy', contracts)
-                            self.print(f" * Close SHORT: {symbol} buy {contracts} [TF:{timeframe if timeframe else 'all'}]")
-                            closed_any = True
-                
-                if not closed_any:
-                    self.print(f" * No position found to close for {symbol}")
-                return
-            except Exception as e:
-                self.print(f" * E: Close order failed: {e}")
-                return
-
-        if not amount:
-            self.print(" * E: Amount not found in alert")
-            return
 
         # Set leverage before creating order
         try:
@@ -438,10 +435,10 @@ class account_c:
             
             if command == 'buy':
                 result = self.exchange.create_order(symbol, 'market', 'buy', quantity)
-                self.print(f" * BUY: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
+                self.print(f" * ✅ BUY: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
             elif command == 'sell':
                 result = self.exchange.create_order(symbol, 'market', 'sell', quantity)
-                self.print(f" * SELL: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
+                self.print(f" * ✅ SELL: {symbol} {quantity} @ {price} | TF:{timeframe} LEV:{leverage}x | ${amount:.2f}")
                 
         except Exception as e:
             self.print(f" * E: Order failed: {e}")
@@ -504,7 +501,7 @@ def generatePositionsString()->str:
                     balanceString = ' * Balance: Unable to fetch'
 
             msg += '=====================\n'
-            msg += f'🤖 MULTI-TF BOT STATUS - {account.accountName}\n'
+            msg += f'🤖 WHOOK MULTI-TF BOT - {account.accountName}\n'
             msg += f'Positions: {numPositions}{balanceString}\n'
             msg += '=====================\n'
             
@@ -574,7 +571,7 @@ def generatePositionsString()->str:
 ###################
 
 print('----------------------------')
-print('Starting WHOOK Multi-TimeFrame Bot for Koyeb...')
+print('Starting WHOOK Multi-TimeFrame Bot with FIXED CLOSE...')
 
 # Initialize Flask app first
 app = Flask(__name__)
@@ -666,12 +663,17 @@ print(f"Successfully initialized {successful_accounts} out of {len(accounts_data
 @app.route('/', methods=['GET'])
 def home():
     """Health check endpoint"""
-    return f'WHOOK Multi-TimeFrame Bot is running! {successful_accounts} accounts active.', 200
+    return f'WHOOK Multi-TimeFrame Bot with FIXED CLOSE is running! {successful_accounts} accounts active.', 200
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint for Koyeb"""
     return 'OK', 200
+
+@app.route('/keep-alive', methods=['GET'])
+def keep_alive():
+    """Keep-alive endpoint to prevent deep sleep"""
+    return 'ALIVE', 200
 
 @app.route('/whook', methods=['GET','POST'])
 def webhook():
@@ -709,7 +711,7 @@ def webhook():
             
             if response == 'status':
                 # Strategy status endpoint
-                status_msg = "🤖 MULTI-TIMEFRAME BOT STATUS\n"
+                status_msg = "🤖 WHOOK MULTI-TIMEFRAME BOT - FIXED CLOSE\n"
                 status_msg += "=" * 50 + "\n"
                 status_msg += f"⏰ Server Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 status_msg += f"🔗 Active Accounts: {len(accounts)}\n"
@@ -726,7 +728,7 @@ def webhook():
                 status_msg += "• Barbatrax buy ETHUSDT 5% 4h 5x\n"
                 status_msg += "• Barbatrax sell SOLUSDT 10% 1h 3x\n"
                 status_msg += "• Barbatrax buy ADAUSDT 100% 1d 1x\n"
-                status_msg += "• Barbatrax close BTCUSDT\n"
+                status_msg += "• Barbatrax close BTCUSDT (✅ FIXED - no amount needed!)\n"
                 return app.response_class(f"<pre>{status_msg}</pre>", mimetype='text/html; charset=utf-8')
             
             return 'Not found'
@@ -739,19 +741,20 @@ def webhook():
 
 @app.errorhandler(404)
 def not_found(error):
-    return 'WHOOK Multi-TimeFrame Bot - Endpoint not found', 404
+    return 'WHOOK Multi-TimeFrame Bot with FIXED CLOSE - Endpoint not found', 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return 'WHOOK Multi-TimeFrame Bot - Internal server error', 500
+    return 'WHOOK Multi-TimeFrame Bot with FIXED CLOSE - Internal server error', 500
 
 # Start the webhook server
 if __name__ == '__main__':
     print(f" * Starting Flask server on port {PORT}")
     print(f" * Health check available at /health")
+    print(f" * Keep-alive available at /keep-alive (to prevent deep sleep)")
     print(f" * Webhook available at /whook")
     print(f" * Status available at /whook?response=status")
-    print(f" * Multi-TimeFrame Bot ready to receive alerts!")
+    print(f" * WHOOK Multi-TimeFrame Bot with FIXED CLOSE ready!")
     print('----------------------------')
     
     try:
